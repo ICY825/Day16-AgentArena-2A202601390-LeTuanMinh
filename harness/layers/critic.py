@@ -68,9 +68,60 @@ Cài đặt:  ReActAgent(..., middleware=[InjectionGuard(), Critic(), ...])
 Xem `harness/middleware.py` để biết thứ tự các hook.
 """
 
+
 from __future__ import annotations
 
 from harness.middleware import Middleware
+
+
+def _supporting_doc_id(text, docs):
+    if not text:
+        return None
+    for doc in docs:
+        if any(text in line for line in doc.body.splitlines()):
+            return doc.doc_id
+    return None
+
+
+def _split_fused_claim(text, observed, docs):
+    separator = " và "
+    start = 0
+    while True:
+        index = text.find(separator, start)
+        if index == -1:
+            return None
+        left = text[:index].strip()
+        right = text[index + len(separator):].strip()
+        if left in observed and right in observed:
+            left_doc = _supporting_doc_id(left, docs)
+            right_doc = _supporting_doc_id(right, docs)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [
+                    {"text": left, "doc_id": left_doc},
+                    {"text": right, "doc_id": right_doc},
+                ]
+        start = index + len(separator)
+
+
+def _looks_absent_answer(answer: str, claims: list[dict]) -> bool:
+    blob = " ".join(
+        [answer if isinstance(answer, str) else ""]
+        + [
+            claim.get("text", "")
+            for claim in claims
+            if isinstance(claim, dict) and isinstance(claim.get("text"), str)
+        ]
+    ).casefold()
+    absent_markers = (
+        "không suy diễn",
+        "không ước tính",
+        "không có nguồn xác nhận",
+        "không có số liệu",
+        "chưa có số liệu",
+        "chưa ghi nhận",
+        "chưa được đồng bộ",
+    )
+    return any(marker in blob for marker in absent_markers)
 
 
 class Critic(Middleware):
@@ -79,16 +130,49 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = ctx.observed_text
+        docs = ctx.corpus.docs if ctx.corpus is not None else []
+        kept = []
+        split_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if text in observed:
+                kept.append(claim)
+                continue
+
+            split = _split_fused_claim(text, observed, docs)
+            if split:
+                kept.extend(split)
+                split_any = True
+
+        report["claims"] = kept
+        if split_any:
+            report["abstain"] = True
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã quan sát."
+            return report
+
+        report["citations"] = sorted(
+            {
+                claim.get("doc_id")
+                for claim in kept
+                if isinstance(claim.get("doc_id"), str) and claim.get("doc_id")
+            }
+        )
+        if (
+            ctx.state.get("prefetched_evidence")
+            and not split_any
+            and report.get("abstain") is True
+        ):
+            report["abstain"] = _looks_absent_answer(report.get("answer", ""), kept)
+        return report

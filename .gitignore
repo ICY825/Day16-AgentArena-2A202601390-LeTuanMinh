@@ -20,3 +20,5 @@ phases/private/
 
 # macOS
 .DS_Store
+
+.env

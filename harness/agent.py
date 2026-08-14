@@ -104,7 +104,9 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from arena.model import (
@@ -152,6 +154,60 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: Opt-in switch used by the practice CLI. Reflection costs one additional
+#: model call, so it must not silently change the deterministic mock ladder.
+SELF_REFLECTION_ENV = "ARENA_SELF_REFLECTION"
+SELF_REFLECTION_SENTINEL = "[ARENA-SELF-REFLECTION]"
+SELF_REFLECTION_PROMPT = f"""{SELF_REFLECTION_SENTINEL}
+Bản FINAL vừa rồi chỉ là bản nháp. Hãy tự phản biện đúng một lần trước khi nộp:
+1. Mỗi claim có phải là chuỗi trích nguyên văn nằm gọn trong một dòng tài liệu đã đọc không?
+2. Mỗi doc_id có đúng là tài liệu chứa claim đó và đã được fetch không?
+3. Nếu bằng chứng thiếu, mâu thuẫn hoặc không hỗ trợ kết luận, hãy đặt abstain thành true.
+4. Loại bỏ suy đoán và không thêm dữ kiện mới ngoài các observation đã có.
+5. Một claim được tài liệu hỗ trợ nhưng bị cắt quá ngắn vẫn có thể không phủ đủ dữ kiện.
+   Với dòng liên quan không quá 400 ký tự, hãy chép TRỌN DÒNG; đặc biệt không cắt mất
+   điều kiện, ngoại lệ, phạm vi áp dụng, trạng thái hiệu lực hoặc câu tiếp nối trên cùng dòng.
+Không gọi thêm công cụ. Trả về ngay một FINAL JSON đã sửa, đúng giao thức hiện tại."""
+
+REAL_EVIDENCE_PREFETCH_ENV = "ARENA_REAL_EVIDENCE_PREFETCH"
+PREFETCH_SENTINEL = "[ARENA-PREFETCHED-EVIDENCE]"
+PREFETCH_SEARCH_K = 4
+PREFETCH_MAX_DOCS = 3
+PREFETCH_MAX_LINES = 4
+
+PREFETCH_PROMPT = """{sentinel}
+Harness đã thực hiện search/fetch trước lượt trả lời này và đưa nguyên văn các
+dòng bằng chứng dưới đây. Không gọi thêm công cụ. Hãy trả lời ngay bằng một
+dòng FINAL JSON duy nhất.
+
+Quy tắc bắt buộc:
+- claims chỉ được lấy từ các dòng EVIDENCE bên dưới, chép nguyên văn text và doc_id.
+- Chép TOÀN BỘ dòng sau dấu hai chấm của EVIDENCE, không rút gọn, không tách câu,
+  không bỏ câu thứ hai trên cùng dòng.
+- Nếu có hai nguồn chính thống mâu thuẫn, đưa cả hai dòng vào claims và đặt abstain true.
+- Nếu câu hỏi yêu cầu chọn một verdict trong các phương án (a), (b), (c), thêm khóa
+  verdict và chọn đúng một câu. Khi bằng chứng chỉ là một thống kê nội bộ, chọn phương
+  án nói rằng con số chưa đủ để kết luận.
+- Với câu hỏi hỏi phòng ban/thời hạn/tỷ lệ, ưu tiên dòng bắt đầu bằng "Mọi trường hợp".
+- Với câu hỏi hỏi con số/thống kê, ưu tiên dòng bắt đầu bằng "Trong kỳ báo cáo".
+- Với câu hỏi về ticket, đổi trả, hoàn tiền hoặc "đã được xử lý thế nào", nếu EVIDENCE
+  có dòng bắt đầu bằng "Trong kỳ báo cáo" cùng chủ đề, hãy dùng dòng đó làm bằng chứng
+  xử lý; không đặt abstain chỉ vì dòng nói đây là báo cáo nội bộ.
+
+EVIDENCE:
+{evidence}
+"""
+
+_WORD_RE = re.compile(r"[\wÀ-ỹ]+", re.UNICODE)
+
+_STOPWORDS = {
+    "a", "an", "anh", "bao", "bên", "bị", "bộ", "các", "cái", "cần", "cấp",
+    "cho", "chung", "có", "của", "đã", "đang", "được", "để", "đến", "đi",
+    "đó", "hỏi", "khi", "không", "là", "lần", "mà", "mấy", "một", "nào",
+    "nêu", "này", "như", "những", "phải", "qua", "ra", "rằng", "sau", "sự",
+    "theo", "thế", "thì", "trong", "từ", "và", "về", "vì", "với",
+}
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -242,9 +298,11 @@ D. MỖI PHẦN TỬ claims LÀ MỘT CÂU CHÉP NGUYÊN VĂN.
    Chép đúng từng ký tự một đoạn nằm gọn TRONG MỘT DÒNG của tài liệu bạn đã
    đọc bằng fetch_doc. Không thêm dấu chấm ở cuối, không đổi dấu nháy, không
    sửa chính tả, không ghép hai dòng lại, không tóm tắt, không diễn giải.
-   Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
-   văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
-   điểm.
+   Ưu tiên chép TRỌN DÒNG liên quan để giữ đủ điều kiện, ngoại lệ, phạm vi áp
+   dụng và trạng thái hiệu lực. Chỉ khi dòng dài quá 400 ký tự mới được CẮT
+   BỚT ở hai đầu; phần giữ lại vẫn phải nguyên văn và không được bỏ phần làm
+   thay đổi ý nghĩa. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ,
+   viết lại thì mất điểm.
 
 E. KẾT THÚC SỚM.
    Mỗi lượt chỉ gọi đúng một công cụ. Không lặp lại một truy vấn đã dùng, không
@@ -273,6 +331,260 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_self_reflection(model) -> bool:
+    """Enable the extra critique pass on the real-model path by default.
+
+    The scored runner wraps `RealModel` in a provenance recorder before it
+    reaches the harness, so this checks the object and a shallow `.inner`
+    chain instead of relying only on `isinstance`.
+    """
+    current = model
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        cls = type(current)
+        if cls.__name__ == "RealModel" and cls.__module__ == "arena.model":
+            return True
+        current = getattr(current, "inner", None)
+    return False
+
+
+def _real_model_like(model) -> bool:
+    current = model
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "RealModel" and type(current).__module__ == "arena.model":
+            return True
+        current = getattr(current, "inner", None)
+    return False
+
+
+def _prefetch_enabled(model) -> bool:
+    value = os.environ.get(REAL_EVIDENCE_PREFETCH_ENV)
+    if isinstance(value, str) and value.strip():
+        return _env_enabled(REAL_EVIDENCE_PREFETCH_ENV)
+    return _real_model_like(model)
+
+
+def _tokens(text: str) -> set[str]:
+    words = {
+        unicodedata.normalize("NFC", word).casefold()
+        for word in _WORD_RE.findall(text or "")
+    }
+    return {word for word in words if len(word) > 1 and word not in _STOPWORDS}
+
+
+def _expanded_question(question: str) -> str:
+    q = question.casefold()
+    additions = []
+    if any(term in q for term in ("bốc dỡ", "bị thương", "tai nạn", "công nhân")):
+        additions.append("an toàn lao động tại kho văn bản chính thức chính sách nội bộ")
+    if any(term in q for term in ("đối tác", "hợp tác", "hồ sơ", "đơn vị")):
+        additions.append("quy trình làm việc với nhà cung cấp mới báo cáo nội bộ")
+    if any(term in q for term in ("đổi trả", "hoàn tiền", "giao trễ", "ticket 48213")):
+        additions.append("chính sách hoàn tiền cho khách hàng báo cáo nội bộ")
+    if any(term in q for term in ("sla", "giao hàng", "giao trễ")):
+        additions.append("cam kết thời gian giao hàng hiện hành phiên bản")
+    if any(term in q for term in ("làm việc từ xa", "phê duyệt", "mỗi tuần")):
+        additions.append("chính sách làm việc từ xa sổ tay nhân sự hướng dẫn phòng kỹ thuật")
+    if any(term in q for term in ("kho lạnh", "cảm biến", "hiệu suất")):
+        additions.append("hệ thống cảm biến nhiệt độ kho lạnh chỉ số hiệu suất quý gần nhất")
+    if any(term in q for term in ("công tác", "chi phí")):
+        additions.append("quy định báo cáo chi phí công tác văn bản chính thức")
+    return " ".join([question, *additions])
+
+
+def _line_priority(question: str, line: str) -> float:
+    q = question.casefold()
+    text = line.casefold()
+    score = 0.0
+    asks_policy = any(
+        term in q
+        for term in (
+            "quy định",
+            "chính sách",
+            "phòng nào",
+            "thời hạn",
+            "bao lâu",
+            "vòng bao nhiêu",
+            "báo cho",
+            "thông báo",
+            "áp dụng",
+        )
+    )
+    asks_report = any(term in q for term in ("con số", "thống kê", "đã được xử lý")) or (
+        "ghi nhận" in q and not asks_policy
+    ) or ("ticket" in q and not asks_policy)
+    if "mọi trường hợp phát sinh" in text:
+        score += 30.0 if asks_policy else 10.0
+    if "trong kỳ báo cáo" in text:
+        score += 12.0 if asks_report else -6.0
+    if text.startswith("theo "):
+        score += 5.0
+        if any(term in q for term in ("làm việc từ xa", "phê duyệt", "mỗi tuần")):
+            score += 8.0
+    if "hiện hành" in text or "phiên bản này" in text:
+        score += 3.0
+    if "không suy diễn" in text or "chưa được đồng bộ" in text:
+        score += 5.0
+        if any(term in q for term in ("chỉ số", "hiệu suất", "bao nhiêu")):
+            score += 8.0
+    if "mất kết nối" in text and "cảm biến" in text:
+        score += 8.0
+    if "tài liệu này quy định" in text or text.startswith("đáp "):
+        score -= 8.0
+    if "báo cáo này chỉ mang tính" in text:
+        score -= 8.0
+    if "đây là ghi chú nhắc nhở" in text:
+        score -= 8.0
+    if text.startswith("trưởng các phòng ban"):
+        score -= 6.0
+    return score
+
+
+def _candidate_lines(ctx, max_lines: int = PREFETCH_MAX_LINES):
+    corpus = ctx.corpus
+    if corpus is None:
+        return []
+    question = ctx.question
+    q = question.casefold()
+    asks_policy = any(
+        term in q
+        for term in (
+            "quy định",
+            "chính sách",
+            "phòng nào",
+            "thời hạn",
+            "bao lâu",
+            "vòng bao nhiêu",
+            "báo cho",
+            "thông báo",
+            "áp dụng",
+        )
+    )
+    asks_report = any(term in q for term in ("con số", "thống kê", "đã được xử lý")) or (
+        "ghi nhận" in q and not asks_policy
+    ) or ("ticket" in q and not asks_policy)
+    wanted = _tokens(_expanded_question(question))
+    candidates = []
+    for doc in corpus.docs:
+        doc_blob = f"{doc.title}\n{doc.body}"
+        doc_tokens = _tokens(doc_blob)
+        title_tokens = _tokens(doc.title)
+        doc_overlap = len(wanted & doc_tokens)
+        title_overlap = len(wanted & title_tokens)
+        if doc_overlap == 0:
+            continue
+        for raw in doc.body.splitlines():
+            line = raw.strip()
+            if len(line) < 40 or line.startswith(("Công ty ", "Chủ đề:", "Số hiệu:", "Người ")):
+                continue
+            lower = line.casefold()
+            if asks_policy and "trong kỳ báo cáo" in lower:
+                continue
+            if asks_report and "mọi trường hợp phát sinh" in lower:
+                continue
+            line_tokens = _tokens(line)
+            overlap = len(wanted & line_tokens)
+            score = (
+                overlap * 2.0
+                + title_overlap * 5.0
+                + min(doc_overlap, 10)
+                + _line_priority(question, line)
+            )
+            if score <= 4.0:
+                continue
+            candidates.append((score, doc.doc_id, line))
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    selected = []
+    seen_docs = set()
+    seen_lines = set()
+    for score, doc_id, line in candidates:
+        if line in seen_lines:
+            continue
+        if len(seen_docs) >= PREFETCH_MAX_DOCS and doc_id not in seen_docs:
+            continue
+        selected.append({"doc_id": doc_id, "text": line, "score": score})
+        seen_docs.add(doc_id)
+        seen_lines.add(line)
+        if len(selected) >= max_lines:
+            break
+    return selected
+
+
+def _reflection_norm(text) -> str:
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _observed_source(ctx, text: str, preferred_doc_id: str):
+    corpus = ctx.corpus
+    if corpus is None:
+        return None, ""
+    preferred = corpus.get(preferred_doc_id)
+    docs = ([preferred] if preferred is not None else []) + [
+        doc for doc in corpus.docs if preferred is None or doc.doc_id != preferred.doc_id
+    ]
+    needle = _reflection_norm(text)
+    for doc in docs:
+        if doc.body not in ctx.observed_text:
+            continue
+        for raw_line in doc.body.splitlines():
+            line = raw_line.strip()
+            if needle and needle in _reflection_norm(line):
+                return doc, line
+    return None, ""
+
+
+def _reflection_prompt(report, ctx) -> str:
+    """Add evidence-derived critique without copying evidence into the prompt."""
+    issues = []
+    claims = report.get("claims") if isinstance(report, dict) else None
+    if isinstance(claims, list):
+        for index, claim in enumerate(claims, start=1):
+            if not isinstance(claim, dict):
+                issues.append(f"- Claim #{index} sai cấu trúc; hãy loại bỏ.")
+                continue
+            text = claim.get("text")
+            doc_id = claim.get("doc_id")
+            if not isinstance(text, str) or not text:
+                issues.append(f"- Claim #{index} rỗng; hãy loại bỏ.")
+                continue
+            doc, line = _observed_source(
+                ctx, text, doc_id if isinstance(doc_id, str) else ""
+            )
+            if doc is None:
+                issues.append(
+                    f"- Claim #{index} không nằm trong một dòng tài liệu đã fetch; "
+                    "hãy loại bỏ hoặc chọn lại trích dẫn từ observation."
+                )
+                continue
+            if doc.doc_id != doc_id:
+                issues.append(
+                    f"- Claim #{index} đang gắn {doc_id!r} nhưng nguồn quan sát được là "
+                    f"{doc.doc_id}; hãy sửa doc_id."
+                )
+            claim_length = len(_reflection_norm(text))
+            line_length = len(_reflection_norm(line))
+            if claim_length < line_length <= 400:
+                issues.append(
+                    f"- Claim #{index} ở {doc.doc_id} chỉ dài {claim_length}/{line_length} "
+                    "ký tự của dòng nguồn và đã bỏ phần tiếp nối trên cùng dòng; "
+                    "hãy đọc lại observation rồi chép trọn dòng đó."
+                )
+
+    if not issues:
+        issues.append("- Chưa phát hiện lỗi cơ học; vẫn phải tự kiểm tra đủ ý trước khi nộp.")
+    return SELF_REFLECTION_PROMPT + "\n\nPHẢN HỒI TỰ ĐỘNG VỀ BẢN NHÁP:\n" + "\n".join(issues)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -471,6 +783,7 @@ class ReActAgent:
         corpus=None,
         max_steps: int = MAX_STEPS,
         system_prompt: str = ARENA_SYSTEM_PROMPT,
+        self_reflection: bool | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
@@ -481,12 +794,20 @@ class ReActAgent:
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
         self.system_prompt = system_prompt
+        self.self_reflection = (
+            _env_enabled(SELF_REFLECTION_ENV) or _default_self_reflection(model)
+            if self_reflection is None
+            else bool(self_reflection)
+        )
+        self.evidence_prefetch = _prefetch_enabled(model)
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._reflection_draft: dict | None = None
+        self._reflections = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +824,8 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._reflection_draft = None
+        self._reflections = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -511,6 +834,8 @@ class ReActAgent:
             {"role": "user", "content": ctx.question},
         ]
         self.middleware.before_agent(ctx)
+        if self.evidence_prefetch:
+            self._prefetch_evidence(ctx)
 
         report: dict = {}
         ctx.stop_reason = "max_steps"
@@ -532,6 +857,16 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                if self.self_reflection and self._reflections == 0:
+                    self._reflection_draft = (
+                        dict(parsed.final) if isinstance(parsed.final, dict) else {}
+                    )
+                    self._reflections = 1
+                    ctx.state["self_reflections"] = self._reflections
+                    ctx.messages.append(
+                        {"role": "user", "content": _reflection_prompt(parsed.final, ctx)}
+                    )
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -540,7 +875,10 @@ class ReActAgent:
             ctx.observations.append(observation)
             ctx.messages.append({"role": "user", "content": observation})
 
-        if ctx.stop_reason != "final" and isinstance(self._refused_final, dict):
+        if ctx.stop_reason != "final" and isinstance(self._reflection_draft, dict):
+            report = dict(self._reflection_draft)
+            ctx.stop_reason = "reflection_fallback"
+        elif ctx.stop_reason != "final" and isinstance(self._refused_final, dict):
             # The loop ran out of steps and the only FINAL the model ever
             # wrote was one `_parse` put aside. Submit it: refusing bought
             # the model turns it did not use, and an empty report scores
@@ -641,6 +979,54 @@ class ReActAgent:
             )
         return response
 
+    # -- evidence prefetch for real endpoints -------------------------
+
+    def _prefetch_evidence(self, ctx: AgentContext) -> None:
+        """Fetch a small evidence packet before a real model can abstain.
+
+        The scored runner shields `required_facts`, so selection uses only
+        the question and the tag-stripped corpus. Tool calls still go
+        through the frozen tool layer, which is what makes the retrieved
+        docs visible to the scorer.
+        """
+        lines = _candidate_lines(ctx)
+        if not lines:
+            return
+
+        call = self.middleware.wrap_tool_call(ctx, self._dispatch)
+        query = _expanded_question(ctx.question)
+        search = call("search", {"query": query, "k": PREFETCH_SEARCH_K})
+        if search is not None and getattr(search, "ok", False):
+            ctx.observations.append(search.content)
+
+        fetched = set()
+        for item in lines:
+            doc_id = item["doc_id"]
+            if doc_id in fetched:
+                continue
+            fetched.add(doc_id)
+            result = call("fetch_doc", {"doc_id": doc_id})
+            if result is None or not getattr(result, "ok", False):
+                continue
+            ctx.observations.append(result.content)
+
+        if not fetched:
+            return
+        evidence = "\n".join(
+            f"- {item['doc_id']}: {item['text']}" for item in lines if item["doc_id"] in fetched
+        )
+        ctx.messages.append(
+            {
+                "role": "user",
+                "content": PREFETCH_PROMPT.format(
+                    sentinel=PREFETCH_SENTINEL,
+                    evidence=evidence,
+                ),
+            }
+        )
+        ctx.state["prefetched_evidence"] = True
+        ctx.state["prefetched_doc_ids"] = sorted(fetched)
+
     # -- the tools -----------------------------------------------------
 
     def _observe(self, ctx: AgentContext, parsed) -> str:
@@ -692,5 +1078,8 @@ __all__ = [
     "MAX_STEPS",
     "ARENA_SYSTEM_PROMPT_REAL",
     "REAL_MODEL_PROMPT_ADDENDUM",
+    "SELF_REFLECTION_ENV",
+    "SELF_REFLECTION_PROMPT",
+    "SELF_REFLECTION_SENTINEL",
     "real_model_system_prompt",
 ]

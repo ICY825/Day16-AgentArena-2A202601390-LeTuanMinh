@@ -80,6 +80,7 @@ from arena.runner import (  # noqa: E402
 
 SCHEMA = "arena-scores/1"
 DEFAULT_OUT = LAB_ROOT / "runs" / "practice.json"
+DEFAULT_ENV = LAB_ROOT / ".env"
 
 #: Thứ tự cài đặt năm lớp — xem `harness/middleware.py`.
 STACK_ORDER = (
@@ -89,6 +90,21 @@ STACK_ORDER = (
     "budget_policy",
     "retry",
 )
+
+
+def load_dotenv(path: Path = DEFAULT_ENV) -> None:
+    """Load simple KEY=VALUE lines without overwriting real environment vars."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _student_layers(names):
@@ -289,6 +305,8 @@ def _diagnostic(result, corpus) -> dict:
 
 
 def main(argv=None) -> int:
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="Chạy vòng luyện tập Agent Arena và chấm điểm.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
